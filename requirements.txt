@@ -1,5 +1,7 @@
 numpy
 matplotlib
 scipy
-uproot     # optional, only needed if you use FastMTT_utils.py
-pandas     # optional, only needed if you use FastMTT_utils.py
+pandas
+pyarrow    # parquet input/output
+uproot     # optional, only needed for .root input
+pytest     # optional, only needed to run tests/
