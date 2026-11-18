@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+images/
+merged.parquet
+*.parquet
+!data/*.parquet

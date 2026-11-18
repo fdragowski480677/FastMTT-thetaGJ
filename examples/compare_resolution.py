@@ -100,7 +100,7 @@ def main():
 
     bins = np.arange(-1.0, 1.0 + 1e-9, 0.04)
     present = [(k, n) for k, n in CATEGORIES if any(res.get(k, np.empty(0)).size for _, res in runs)]
-    fig, axes = plt.subplots(1, len(present), figsize=(4.6*len(present), 4.2), facecolor=SURFACE, squeeze=False)
+    fig, axes = plt.subplots(1, len(present), figsize=(4.6*len(present), 4.6), facecolor=SURFACE, squeeze=False)
     for ax, (key, name) in zip(axes[0], present):
         ax.set_facecolor(SURFACE)
         for i, (label, res) in enumerate(runs):
@@ -109,8 +109,11 @@ def main():
                 continue
             m = metrics(r)
             ax.hist(np.clip(r, bins[0], bins[-1]), bins=bins, density=True, histtype="step", linewidth=2,
-                    color=COLORS[i % len(COLORS)], linestyle=STYLES[i % len(STYLES)],
-                    label=f"{label}  (w68 {m['width68']:.3f})")
+                    color=COLORS[i % len(COLORS)], linestyle=STYLES[i % len(STYLES)], label=label)
+            ax.text(0.07, 0.97 - 0.07*i, f"w68 {m['width68']:.3f}", transform=ax.transAxes, ha="left", va="top",
+                    fontsize=8.5, color=INK2)
+            ax.plot([0.04], [0.955 - 0.07*i], transform=ax.transAxes, marker="s", markersize=6,
+                    color=COLORS[i % len(COLORS)], clip_on=False)
         ax.set_title(name, color=INK, fontsize=11)
         ax.set_xlabel(r"$(p_T^{reco} - p_T^{gen}) / p_T^{gen}$", color=INK2)
         ax.tick_params(colors=INK2, labelsize=9)
@@ -118,11 +121,15 @@ def main():
             s.set_color(GRID)
         ax.grid(True, color=GRID, linewidth=0.8)
         ax.set_axisbelow(True)
-        ax.legend(fontsize=8, frameon=False, labelcolor=INK)
     axes[0][0].set_ylabel("Density", color=INK2)
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=len(runs), frameon=False, fontsize=9, labelcolor=INK,
+               bbox_to_anchor=(0.5, 0.93))
     if args.title:
-        fig.suptitle(args.title, color=INK, fontsize=12)
-    fig.tight_layout()
+        fig.suptitle(args.title, color=INK, fontsize=12, y=0.99)
+    fig.text(0.5, 0.01, "Values beyond ±1 are collected in the edge bins.  w68 = half-width of the central 68% interval.",
+             ha="center", fontsize=8.5, color=INK2)
+    fig.tight_layout(rect=(0, 0.04, 1, 0.86))
     fig.savefig(out / "resolution_comparison.png", dpi=150, facecolor=SURFACE)
     print(f"Saved {out / 'resolution_comparison.png'}")
 

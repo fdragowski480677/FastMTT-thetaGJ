@@ -68,6 +68,18 @@ visualisation.py will produce example histograms of reconstructed mass and pt re
 
 batch_processing.py will calculate batch of events using multiprocessing regime.
 
+### Gottfried-Jackson angle component (PV -> SV direction)
+
+For ntuples with primary and secondary vertex columns (`PVBS_*`/`PV_*`, `sv_*_1/2`, `hasRefitSV_*`),
+the tau flight direction can be added to the likelihood:
+
+```
+python3 examples/batch_processing.py file.parquet --channel tt --window --gj
+python3 examples/compare_resolution.py base=base.parquet gj=gj.parquet --out-dir cmp
+```
+
+See section 5 of [DOCUMENTATION.md](./DOCUMENTATION.md). Tests: `python3 -m pytest tests`.
+
 ## Documentation
 
 For full details on inputs, batching, additional options, and likelihood components, see [DOCUMENTATION.md](./DOCUMENTATION.md).

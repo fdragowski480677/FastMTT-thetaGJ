@@ -269,3 +269,111 @@ Loads tau candidates and MET information from a CSV file.
 #### `load_input_file(file_path, tree_name=None, branches=None)`
 Generic loader that automatically chooses the correct loading function
 depending on the file extension.
+---
+
+## 5. Gottfried-Jackson (GJ) angle component
+
+An optional likelihood component that uses the tau flight direction measured from the
+primary vertex (PV) to the refitted secondary vertex (SV). It is disabled by default.
+
+```python
+fMTT = FastMTT.FastMTT()
+fMTT.myLikelihood.enableLikelihoodComponents(MET=True, mass=True, mass_constraint=False, window=True, GJ=True)
+fMTT.run(measuredTauLeptons, measuredMETx, measuredMETy, covMET,
+         PV=PV, SV=SV, covPV=covPV, covSV=covSV, hasSV=hasSV)
+fMTT.gj_used   # (N, 2) bool, legs that entered the component
+```
+
+Extra inputs (positions in cm, covariances in cm²):
+- `PV` (N, 3), `SV` (N, 2, 3), `covPV` (N, 3, 3), `covSV` (N, 2, 3, 3)
+- `hasSV` (N, 2) bool. If omitted, a leg has an SV when its SV position is not all zeros.
+
+From the command line:
+
+```
+python examples/batch_processing.py file.parquet --channel tt --window --gj
+```
+
+### Method
+
+The GJ angle θ is the opening angle between the tau and its visible decay products.
+
+1. **Measured angle.** n = (SV − PV)/|SV − PV| is the flight direction and v the direction of the
+   reconstructed visible momentum, so cos θ_meas = n·v.
+2. **Predicted angle.** For an energy fraction x = E_vis/E_tau, a massless invisible system
+   (one neutrino, hadronic decays) requires
+   `cos θ(x) = (2 E_tau E_vis − m_tau² − m_vis²) / (2 |p_tau| |p_vis|)` with E_tau = E_vis/x.
+   Kinematically forbidden x give cos θ > 1 and are mapped to θ = 0.
+   The largest allowed angle is sin θ_max = (m_tau² − m_vis²)/(2 m_tau |p_vis|).
+3. **Error propagation (analytic).** With w = v − cos θ n and the unit vector u = w/sin θ,
+   ∂θ/∂SV = −u/L and ∂θ/∂PV = +u/L, where L is the flight length. Hence
+   σ²(θ_i) = (u_iᵀ (C_SV,i + C_PV) u_i)/L_i² + σ_angle², and the two legs are correlated through
+   the shared PV: cov(θ_1, θ_2) = u_1ᵀ C_PV u_2 /(L_1 L_2). Only the error perpendicular to the
+   flight direction enters, so the large SV uncertainty along the flight line does not matter.
+   σ_angle (`gj_sigma_angle`, default 1.7 mrad) covers the visible-direction resolution and
+   residual effects.
+4. **Likelihood.** `gj_model="gauss"` (default): the bivariate normal distribution of
+   r = (θ_meas,1 − θ(x_1), θ_meas,2 − θ(x_2)) with the covariance above. Legs without SV are
+   decoupled and contribute a constant. `gj_model="rice"`: each leg's 2D direction offset is taken
+   as bivariate normal and the unknown azimuth of the tau around the visible direction is
+   integrated out, which multiplies the Gaussian term by `i0e(θ_meas θ(x)/σ²)`.
+
+A leg enters the component only if it is hadronic, has an SV, and
+(θ_meas − θ_max)/σ < `gj_max_pull` (default 5). The cut removes SVs reconstructed behind the PV.
+Per-event constant factors are dropped because they do not move the maximum.
+
+### Vertex covariance placeholder
+
+The Run3_2022 ntuples contain PV and SV positions but no vertex covariances.
+`FastMTT_IO.placeholder_vertex_covariances` provides a constant model calibrated on these files:
+the SV displacement perpendicular to the generated tau direction, fitted versus flight length as
+σ²(L) = s_v² + (s_a L)², gives s_v ≈ 10 µm transverse and ≈ 17 µm along z with the
+beamspot-constrained PV. The split between PV and SV is an assumption. Pulls of θ_meas against
+the generated GJ angle have unit width with this model. Replace it with event-by-event
+covariances once they are stored.
+
+Refitted SVs exist only for 3-prong decays (decay modes 10, 11), about 30% of hadronic legs.
+
+### Options
+
+| attribute / CLI flag | default | meaning |
+|---|---|---|
+| `enable_GJ` / `--gj` | off | enable the component |
+| `--pv` | `PVBS` | PV columns: beamspot-constrained `PVBS_*` or `PV_*` |
+| `gj_model` / `--gj-model` | `gauss` | likelihood shape, `gauss` or `rice` |
+| `gj_sigma_angle` / `--gj-sigma-angle` | 1.7e-3 | constant angular resolution [rad] |
+| `gj_max_pull` / `--gj-max-pull` | 5 | quality cut on the measured angle |
+| `--gj-cov-scale` | 1 | scale on the placeholder vertex resolution |
+
+`batch_processing.py` also gained `--output`, `--plot-dir` and the `et` channel.
+
+### Validation
+
+`examples/compare_resolution.py` compares outputs of `batch_processing.py`. Resolution is
+r = (pT_reco − pT_gen)/pT_gen for hadronic legs only (|genPart_pdgId| = 15), because for electron
+and muon legs `genPart_pt` is the visible lepton.
+
+Tests: `python -m pytest tests`.
+
+Results on Run3_2022 ggH→ττ, window on, 68% half-width of r (lower is better):
+
+| channel | legs | baseline | + GJ gauss | + GJ rice |
+|---|---|---|---|---|
+| tt | 3-prong with SV | 0.157 | 0.148 | 0.157 |
+| mt | 3-prong with SV | 0.162 | 0.150 | 0.158 |
+| et | 3-prong with SV | 0.163 | 0.151 | 0.160 |
+| tt | all hadronic | 0.161 | 0.156 | 0.160 |
+| mt | all hadronic | 0.171 | 0.167 | 0.170 |
+| et | all hadronic | 0.174 | 0.170 | 0.172 |
+
+The fraction of 3-prong legs within 10% of the generated pT rises from about 0.46 to 0.49–0.50
+with `gauss`. Results change by less than 0.002 when the placeholder vertex resolution is scaled
+by 0.7 or 1.5, when `gj_sigma_angle` is 1.0 or 2.5 mrad, with `PV_*` instead of `PVBS_*`, or with
+`gj_max_pull` = 3. The parameters were checked on tt only; mt and et are independent.
+
+Interpretation: the gain is largest for legs whose angle is measured precisely (σ/θ_max < 0.35),
+but `gauss` also helps legs whose angle error exceeds θ_max. There it acts like a soft penalty on
+extreme x, where θ(x) → 0. `rice` keeps only the genuine measurement information and is therefore
+weaker. Event-by-event vertex covariances should make the component more informative.
+
+The component costs about 40–50% extra run time (tt: 17 s → 25 s on 8 workers).
