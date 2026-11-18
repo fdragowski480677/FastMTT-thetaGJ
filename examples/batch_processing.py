@@ -10,7 +10,10 @@ fastmtt_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "so
 if fastmtt_path not in sys.path:
     sys.path.insert(0, fastmtt_path)
 
-from FastMTT_IO import process_FastMTT
+from FastMTT_IO import process_FastMTT, placeholder_vertex_covariances
+
+# decay_type of each leg per channel when not given in the input: 1 had, 2 electron, 3 muon
+CHANNEL_DECAY_TYPES = {"tt": (1, 1), "mt": (3, 1), "et": (2, 1)}
 
 
 def _first_existing(keys, preferred, fallbacks=()):
@@ -97,7 +100,7 @@ def plot_pt_resolution_hist(
     print(f"Saved plot: {out}")
 
 
-def _load_parquet_inputs(file_path, entry_stop=None, channel="tt"):
+def _load_parquet_inputs(file_path, entry_stop=None, channel="tt", pv_prefix="PVBS", gj_cov_scale=1.0):
     try:
         import pandas as pd
     except Exception as e:
@@ -116,12 +119,34 @@ def _load_parquet_inputs(file_path, entry_stop=None, channel="tt"):
     if entry_stop is not None:
         df = df.iloc[: int(entry_stop)]
 
-    parsed = _parquet_df_to_fastmtt_inputs(df, channel=channel)
+    parsed = _parquet_df_to_fastmtt_inputs(df, channel=channel, pv_prefix=pv_prefix, gj_cov_scale=gj_cov_scale)
     parsed["_df"] = df
     return parsed
 
 
-def _parquet_df_to_fastmtt_inputs(df, channel="tt"):
+def _vertex_inputs(df, pv_prefix="PVBS", gj_cov_scale=1.0):
+    """PV/SV inputs for the Gottfried-Jackson component, or None if the columns are missing.
+
+    The input files carry no vertex covariance yet, so the placeholder resolution model
+    from FastMTT_IO is used (gj_cov_scale multiplies its standard deviations).
+    """
+    cols = set(df.columns)
+    pv_cols = [f"{pv_prefix}_{c}" for c in "xyz"]
+    sv_cols = [[f"sv_{c}_{leg}" for c in "xyz"] for leg in (1, 2)]
+    if not all(c in cols for c in pv_cols + sv_cols[0] + sv_cols[1]):
+        return None
+
+    PV = df[pv_cols].to_numpy(dtype=np.float64)
+    SV = np.stack([df[sv_cols[0]].to_numpy(dtype=np.float64), df[sv_cols[1]].to_numpy(dtype=np.float64)], axis=1)
+    if "hasRefitSV_1" in cols and "hasRefitSV_2" in cols:
+        hasSV = np.stack([df["hasRefitSV_1"].to_numpy(dtype=bool), df["hasRefitSV_2"].to_numpy(dtype=bool)], axis=1)
+    else:
+        hasSV = np.any(SV != 0, axis=-1)
+    covPV, covSV = placeholder_vertex_covariances(len(df), scale=gj_cov_scale)
+    return {"PV": PV, "SV": SV, "covPV": covPV, "covSV": covSV, "hasSV": hasSV}
+
+
+def _parquet_df_to_fastmtt_inputs(df, channel="tt", pv_prefix="PVBS", gj_cov_scale=1.0):
     cols = set(df.columns)
 
     b_pt1 = _first_existing(cols, "pt_1")
@@ -191,14 +216,11 @@ def _parquet_df_to_fastmtt_inputs(df, channel="tt"):
         type1 = df[b_type1].to_numpy(dtype=np.int32)
         type2 = df[b_type2].to_numpy(dtype=np.int32)
     else:
-        if channel == "mt":
-            type1 = np.full(n, 3, dtype=np.int32)
-            type2 = np.full(n, 1, dtype=np.int32)
-        elif channel == "tt":
-            type1 = np.full(n, 1, dtype=np.int32)
-            type2 = np.full(n, 1, dtype=np.int32)
-        else:
+        if channel not in CHANNEL_DECAY_TYPES:
             raise ValueError(f"Unsupported channel: {channel}")
+        t1, t2 = CHANNEL_DECAY_TYPES[channel]
+        type1 = np.full(n, t1, dtype=np.int32)
+        type2 = np.full(n, t2, dtype=np.int32)
 
     dm1 = df[b_dm1].to_numpy(dtype=np.int32) if b_dm1 else np.full(n, -1, dtype=np.int32)
     dm2 = df[b_dm2].to_numpy(dtype=np.int32) if b_dm2 else np.full(n, -1, dtype=np.int32)
@@ -231,6 +253,7 @@ def _parquet_df_to_fastmtt_inputs(df, channel="tt"):
         "measuredMETy": mety,
         "covMET": covMET,
         "n": n,
+        "vertex": _vertex_inputs(df, pv_prefix=pv_prefix, gj_cov_scale=gj_cov_scale),
     }
 
 
@@ -265,12 +288,48 @@ def run_fastmtt_parquet(
     entry_stop=None,
     chunk_rows=200_000,
     window=False,
+    gj=False,
+    pv_prefix="PVBS",
+    gj_cov_scale=1.0,
+    gj_options=None,
+    output=None,
+    plot_dir="images/fastMTT",
 ):
-    output_parquet = Path.cwd() / "merged.parquet"
+    output_parquet = Path(output) if output else Path.cwd() / "merged.parquet"
+    output_parquet.parent.mkdir(parents=True, exist_ok=True)
+    plot_dir = Path(plot_dir)
+
+    def _run(parsed):
+        vertex = parsed["vertex"] if gj else None
+        if gj and vertex is None:
+            raise ValueError(f"--gj needs columns {pv_prefix}_x/y/z and sv_x/y/z_1/2 in the input")
+        return process_FastMTT(
+            parsed["measuredTauLeptons"],
+            parsed["measuredMETx"],
+            parsed["measuredMETy"],
+            parsed["covMET"],
+            batch_size=batch_size,
+            num_workers=num_workers,
+            window=bool(window),
+            vertex=vertex,
+            gj=bool(gj),
+            gj_options=gj_options,
+            return_gj_used=True,
+        )
+
+    def _add_outputs(df, pt0, tau1pt0, tau2pt0, gj_used):
+        df["FastMTT_pt"] = np.asarray(pt0, dtype=np.float32)
+        df["FastMTT_pt_1"] = np.asarray(tau1pt0, dtype=np.float32)
+        df["FastMTT_pt_2"] = np.asarray(tau2pt0, dtype=np.float32)
+        if gj:
+            df["FastMTT_GJ_used_1"] = gj_used[:, 0]
+            df["FastMTT_GJ_used_2"] = gj_used[:, 1]
+        return df
 
     # If chunk_rows <= 0, keep the old behaviour (load whole file)
     if chunk_rows is None or int(chunk_rows) <= 0:
-        parsed = _load_parquet_inputs(str(input_parquet), entry_stop=entry_stop, channel=channel)
+        parsed = _load_parquet_inputs(str(input_parquet), entry_stop=entry_stop, channel=channel,
+                                      pv_prefix=pv_prefix, gj_cov_scale=gj_cov_scale)
 
         measuredTauLeptons = parsed["measuredTauLeptons"]
         metx = parsed["measuredMETx"]
@@ -279,24 +338,13 @@ def run_fastmtt_parquet(
 
         print("Input shapes:", measuredTauLeptons.shape, covMET.shape, metx.shape, mety.shape)
 
-        _m0, pt0, tau1pt0, tau2pt0 = process_FastMTT(
-            measuredTauLeptons,
-            metx,
-            mety,
-            covMET,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            window=bool(window),
-        )
+        _m0, pt0, tau1pt0, tau2pt0, gj_used = _run(parsed)
 
         df = parsed.get("_df")
         if df is None:
             raise RuntimeError("Internal error: parquet dataframe not available")
 
-        df = df.copy()
-        df["FastMTT_pt"] = np.asarray(pt0, dtype=np.float32)
-        df["FastMTT_pt_1"] = np.asarray(tau1pt0, dtype=np.float32)
-        df["FastMTT_pt_2"] = np.asarray(tau2pt0, dtype=np.float32)
+        df = _add_outputs(df.copy(), pt0, tau1pt0, tau2pt0, gj_used)
 
         try:
             df.to_parquet(output_parquet, index=False)
@@ -319,12 +367,12 @@ def run_fastmtt_parquet(
                 plot_pt_resolution_hist(
                     res1,
                     title="Resolution leg1: (FastMTT_pt_1 - genPart_pt_1) / genPart_pt_1",
-                    output_path="images/fastMTT/resolution_leg1.png",
+                    output_path=plot_dir / "resolution_leg1.png",
                 )
                 plot_pt_resolution_hist(
                     res2,
                     title="Resolution leg2: (FastMTT_pt_2 - genPart_pt_2) / genPart_pt_2",
-                    output_path="images/fastMTT/resolution_leg2.png",
+                    output_path=plot_dir / "resolution_leg2.png",
                 )
             except Exception as e:
                 print(f"Resolution plotting skipped (parquet): {e}")
@@ -368,7 +416,8 @@ def run_fastmtt_parquet(
             if len(df_chunk) > remaining:
                 df_chunk = df_chunk.iloc[:remaining]
 
-        chunk_parsed = _parquet_df_to_fastmtt_inputs(df_chunk, channel=channel)
+        chunk_parsed = _parquet_df_to_fastmtt_inputs(df_chunk, channel=channel, pv_prefix=pv_prefix,
+                                                     gj_cov_scale=gj_cov_scale)
         measuredTauLeptons = chunk_parsed["measuredTauLeptons"]
         metx = chunk_parsed["measuredMETx"]
         mety = chunk_parsed["measuredMETy"]
@@ -376,20 +425,9 @@ def run_fastmtt_parquet(
 
         print("Chunk shapes:", measuredTauLeptons.shape, covMET.shape, metx.shape, mety.shape)
 
-        _m0, pt0, tau1pt0, tau2pt0 = process_FastMTT(
-            measuredTauLeptons,
-            metx,
-            mety,
-            covMET,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            window=bool(window),
-        )
+        _m0, pt0, tau1pt0, tau2pt0, gj_used = _run(chunk_parsed)
 
-        df_out = df_chunk.copy()
-        df_out["FastMTT_pt"] = np.asarray(pt0, dtype=np.float32)
-        df_out["FastMTT_pt_1"] = np.asarray(tau1pt0, dtype=np.float32)
-        df_out["FastMTT_pt_2"] = np.asarray(tau2pt0, dtype=np.float32)
+        df_out = _add_outputs(df_chunk.copy(), pt0, tau1pt0, tau2pt0, gj_used)
 
         # Sample required resolution values using FastMTT leg pT (tau1pt0/tau2pt0)
         try:
@@ -429,7 +467,7 @@ def run_fastmtt_parquet(
             plot_pt_resolution_hist(
                 res1,
                 title="Resolution leg1: (FastMTT_pt_1 - genPart_pt_1) / genPart_pt_1",
-                output_path="images/fastMTT/resolution_leg1.png",
+                output_path=plot_dir / "resolution_leg1.png",
             )
         else:
             print("Resolution leg1 skipped (streaming): missing genPart_pt_1 or no samples")
@@ -442,7 +480,7 @@ def run_fastmtt_parquet(
             plot_pt_resolution_hist(
                 res2,
                 title="Resolution leg2: (FastMTT_pt_2 - genPart_pt_2) / genPart_pt_2",
-                output_path="images/fastMTT/resolution_leg2.png",
+                output_path=plot_dir / "resolution_leg2.png",
             )
         else:
             print("Resolution leg2 skipped (streaming): missing genPart_pt_2 or no samples")
@@ -453,7 +491,7 @@ def run_fastmtt_parquet(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input", help="Input file (.parquet)")
-    parser.add_argument("--channel", default="tt", choices=["mt", "tt"], help="Needed to infer leg types if not present")
+    parser.add_argument("--channel", default="tt", choices=sorted(CHANNEL_DECAY_TYPES), help="Needed to infer leg types if not present")
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument(
@@ -473,7 +511,32 @@ def main():
         action="store_true",
         help="Enable FastMTT likelihood window components (enableLikelihoodComponents(window=True))",
     )
+    parser.add_argument(
+        "--gj",
+        action="store_true",
+        help="Enable the Gottfried-Jackson component from the PV->SV direction (needs PV and sv_* columns)",
+    )
+    parser.add_argument("--pv", default="PVBS", choices=["PVBS", "PV"],
+                        help="Primary vertex columns for the GJ component (default: beamspot-constrained PVBS)")
+    parser.add_argument("--gj-cov-scale", type=float, default=1.0,
+                        help="Scale factor on the placeholder PV/SV resolution (standard deviations)")
+    parser.add_argument("--gj-sigma-angle", type=float, default=None,
+                        help="Constant angular resolution in rad added to the GJ angle (default: Likelihood.gj_sigma_angle)")
+    parser.add_argument("--gj-max-pull", type=float, default=None,
+                        help="Drop legs whose measured GJ angle exceeds the physical maximum by more than this many sigma")
+    parser.add_argument("--gj-model", default=None, choices=["rice", "gauss"],
+                        help="GJ likelihood shape (default: Likelihood.gj_model)")
+    parser.add_argument("--output", default=None, help="Output parquet (default: ./merged.parquet)")
+    parser.add_argument("--plot-dir", default="images/fastMTT", help="Directory for resolution plots")
     args = parser.parse_args()
+
+    gj_options = {}
+    if args.gj_sigma_angle is not None:
+        gj_options["gj_sigma_angle"] = args.gj_sigma_angle
+    if args.gj_max_pull is not None:
+        gj_options["gj_max_pull"] = args.gj_max_pull
+    if args.gj_model is not None:
+        gj_options["gj_model"] = args.gj_model
 
     file_path = Path(args.input)
     if file_path.suffix.lower() != ".parquet":
@@ -487,6 +550,12 @@ def main():
         entry_stop=args.entry_stop,
         chunk_rows=args.chunk_rows,
         window=args.window,
+        gj=args.gj,
+        pv_prefix=args.pv,
+        gj_cov_scale=args.gj_cov_scale,
+        gj_options=gj_options or None,
+        output=args.output,
+        plot_dir=args.plot_dir,
     )
 
 
