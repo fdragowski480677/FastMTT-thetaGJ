@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import time
 from scipy.constants import physical_constants
 import os
+import warnings
 import Likelihood
 
 ###Main reference: https://github.com/SVfit/ClassicSVfit/blob/fastMTT_2024/src/FastMTT.cc ###
@@ -50,9 +51,20 @@ class FastMTT:
         #-1 = no plot
         self.WhichLikelihoodPlot = -1
 
+        #(N, 2) bool: legs that entered the Gottfried-Jackson component in the last run
+        self.gj_used = None
+
         return
     
-    def run(self, measuredTauLeptons, measuredMETx, measuredMETy, covMET):
+    def run(self, measuredTauLeptons, measuredMETx, measuredMETy, covMET,
+            PV=None, SV=None, covPV=None, covSV=None, hasSV=None):
+        """Reconstruct the di-tau system.
+
+        Optional vertex inputs, used only by the Gottfried-Jackson component
+        (myLikelihood.enableLikelihoodComponents(GJ=True)):
+          PV (N, 3), SV (N, 2, 3), covPV (N, 3, 3), covSV (N, 2, 3, 3), hasSV (N, 2) bool.
+        If hasSV is None, a leg has an SV when its SV position is not all zeros.
+        """
 
         if self.PrintTime:
             start_real_time = time.time()
@@ -86,6 +98,17 @@ class FastMTT:
         self.myLikelihood.covMET = covMET
 
         self.myLikelihood.setLeptonInputs(self.p4_Lepton1, self.p4_Lepton2, aLepton1[:, 0], aLepton2[:, 0], aLepton1[:, 5], aLepton2[:, 5])
+
+        self.myLikelihood.clearVertexInputs()
+        self.gj_used = np.zeros((len(measuredMETx), 2), dtype=bool)
+        if self.myLikelihood.enable_GJ:
+            if PV is None or SV is None or covPV is None or covSV is None:
+                warnings.warn("GJ component enabled but no PV/SV inputs given; it is ignored for this run.")
+            else:
+                if hasSV is None:
+                    hasSV = np.any(np.asarray(SV) != 0, axis=-1)
+                self.myLikelihood.setVertexInputs(PV, SV, covPV, covSV, hasSV)
+                self.gj_used = self.myLikelihood.gj_active.copy()
 
         self.scan()
         

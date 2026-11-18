@@ -13,12 +13,43 @@ except Exception:  # pragma: no cover
 # Globalna instancja dla każdego procesu
 global_fMTT = None  
 
-def init_worker(window=False):
+# Likelihood attributes that may be set through gj_options
+GJ_OPTION_NAMES = ("gj_sigma_angle", "gj_max_pull", "gj_model")
+
+###############################################################################
+# Placeholder PV / SV resolution [cm], used when the input has no vertex covariance.
+#
+# Calibrated on Run3_2022 ggH->tautau (3-prong legs with a refitted SV, tt+mt+et):
+# the SV displacement perpendicular to the generated tau direction was fitted versus
+# flight length L as sigma^2(L) = s_v^2 + (s_a L)^2. With the beamspot-constrained PV
+# (PVBS) this gives s_v = 10 um in the transverse plane and ~17 um along z, and an
+# angular term s_a ~ 1.3-1.5 mrad (part of it is rounding of the stored gen direction).
+# Only the PV+SV sum is measured this way; the split below is an assumption and only
+# affects the correlation between the two legs. The angular term is represented by
+# Likelihood.gj_sigma_angle. Replace with event-by-event covariances once available.
+###############################################################################
+PLACEHOLDER_PV_SIGMA = (5.0e-4, 5.0e-4, 8.0e-4)
+PLACEHOLDER_SV_SIGMA = (8.7e-4, 8.7e-4, 15.0e-4)
+
+
+def placeholder_vertex_covariances(n, scale=1.0):
+    """Return (covPV (n, 3, 3), covSV (n, 2, 3, 3)) from the placeholder resolution model."""
+    covPV = np.diag(np.square(PLACEHOLDER_PV_SIGMA)) * scale**2
+    covSV = np.diag(np.square(PLACEHOLDER_SV_SIGMA)) * scale**2
+    return (np.broadcast_to(covPV, (n, 3, 3)).copy(),
+            np.broadcast_to(covSV, (n, 2, 3, 3)).copy())
+
+
+def init_worker(window=False, gj=False, gj_options=None):
     # One FastMTT object for each core
     global global_fMTT
     global_fMTT = FastMTT.FastMTT()
     # Configure likelihood components per worker
-    global_fMTT.myLikelihood.enableLikelihoodComponents(window=window)
+    global_fMTT.myLikelihood.enableLikelihoodComponents(window=window, GJ=gj)
+    for name, val in (gj_options or {}).items():
+        if name not in GJ_OPTION_NAMES:
+            raise ValueError(f"Unknown GJ option '{name}', expected one of {GJ_OPTION_NAMES}")
+        setattr(global_fMTT.myLikelihood, name, val)
 
 def process_batches_for_worker(args):
     worker_id, worker_batches = args
@@ -33,26 +64,35 @@ def process_batches_for_worker(args):
 
 
 def process_single_batch(args):
-    batch_id, measuredTau, METx, METy, covMET = args
+    batch_id, measuredTau, METx, METy, covMET, vertex = args
     global global_fMTT
-    global_fMTT.run(measuredTau, METx, METy, covMET)
-    return batch_id, (global_fMTT.mass, global_fMTT.pt, global_fMTT.tau1pt, global_fMTT.tau2pt)
+    global_fMTT.run(measuredTau, METx, METy, covMET, **(vertex or {}))
+    return batch_id, (global_fMTT.mass, global_fMTT.pt, global_fMTT.tau1pt, global_fMTT.tau2pt, global_fMTT.gj_used)
 
-def process_FastMTT(measuredTauLeptons, xMETs, yMETs, covMETs, batch_size=100, num_workers=4, window=False):
+def process_FastMTT(measuredTauLeptons, xMETs, yMETs, covMETs, batch_size=100, num_workers=4, window=False,
+                    vertex=None, gj=False, gj_options=None, return_gj_used=False):
+    """Run FastMTT in parallel batches.
+
+    vertex: optional dict with keys PV, SV, covPV, covSV, hasSV (arrays with N rows),
+            passed to FastMTT.run for the Gottfried-Jackson component (enabled with gj=True).
+    gj_options: optional dict of Likelihood attributes, see GJ_OPTION_NAMES.
+    return_gj_used: also return an (N, 2) bool array of legs that used the GJ component.
+    """
     num_total = len(measuredTauLeptons)
     num_batches = int(np.ceil(num_total / batch_size))
 
     if num_total == 0:
-        return (
+        empty = (
             np.empty((0,), dtype=np.float32),
             np.empty((0,), dtype=np.float32),
             np.empty((0,), dtype=np.float32),
             np.empty((0,), dtype=np.float32),
         )
+        return empty + (np.empty((0, 2), dtype=bool),) if return_gj_used else empty
 
     print(
         f"FastMTT: n_events={num_total}, batch_size={batch_size}, n_batches={num_batches}, "
-        f"workers={num_workers}, window={window}"
+        f"workers={num_workers}, window={window}, gj={gj}"
     )
 
     # Build batch payloads (batch_id keeps original ordering)
@@ -66,6 +106,7 @@ def process_FastMTT(measuredTauLeptons, xMETs, yMETs, covMETs, batch_size=100, n
                 xMETs[start:stop],
                 yMETs[start:stop],
                 covMETs[start:stop],
+                None if vertex is None else {k: v[start:stop] for k, v in vertex.items()},
             )
         )
     
@@ -74,7 +115,7 @@ def process_FastMTT(measuredTauLeptons, xMETs, yMETs, covMETs, batch_size=100, n
     # Multiprocessing: process per-batch so the parent can report progress.
     results_by_batch = [None] * num_batches
     processed = 0
-    with mp.Pool(processes=num_workers, initializer=init_worker, initargs=(window,)) as pool:
+    with mp.Pool(processes=num_workers, initializer=init_worker, initargs=(window, gj, gj_options)) as pool:
         for batch_id, out in pool.imap_unordered(process_single_batch, batch_args, chunksize=1):
             results_by_batch[batch_id] = out
             # out[0] is mass array for this batch
@@ -82,12 +123,15 @@ def process_FastMTT(measuredTauLeptons, xMETs, yMETs, covMETs, batch_size=100, n
             print(f"  processed {processed}/{num_total} events (batch {batch_id + 1}/{num_batches})")
 
     # Concatenate in the correct original order
-    mFast, ptFast, tau1pt, tau2pt = zip(*results_by_batch)
+    mFast, ptFast, tau1pt, tau2pt, gj_used = zip(*results_by_batch)
     
     end_time = time.time()
     print(f"Processing FastMTT took {end_time - start_time:.2f} seconds")
     
-    return np.concatenate(mFast, axis=0), np.concatenate(ptFast, axis=0), np.concatenate(tau1pt, axis = 0), np.concatenate(tau2pt, axis = 0)
+    out = (np.concatenate(mFast, axis=0), np.concatenate(ptFast, axis=0), np.concatenate(tau1pt, axis = 0), np.concatenate(tau2pt, axis = 0))
+    if return_gj_used:
+        out = out + (np.concatenate(gj_used, axis=0),)
+    return out
 
 def read_root_file(file_path, tree_name, branches, entry_stop=None):
     if uproot is None:
