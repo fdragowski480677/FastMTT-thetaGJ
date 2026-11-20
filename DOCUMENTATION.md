@@ -329,7 +329,8 @@ The Run3_2022 ntuples contain PV and SV positions but no vertex covariances.
 the SV displacement perpendicular to the generated tau direction, fitted versus flight length as
 σ²(L) = s_v² + (s_a L)², gives s_v ≈ 10 µm transverse and ≈ 17 µm along z with the
 beamspot-constrained PV. The split between PV and SV is an assumption. Pulls of θ_meas against
-the generated GJ angle have unit width with this model. Replace it with event-by-event
+the generated GJ angle have a width of about 1.1 on average, but the model underestimates the
+error of the best-measured legs (width 1.2–1.5 for σ/θ_max < 0.5). Replace it with event-by-event
 covariances once they are stored.
 
 Refitted SVs exist only for 3-prong decays (decay modes 10, 11), about 30% of hadronic legs.
@@ -371,9 +372,23 @@ with `gauss`. Results change by less than 0.002 when the placeholder vertex reso
 by 0.7 or 1.5, when `gj_sigma_angle` is 1.0 or 2.5 mrad, with `PV_*` instead of `PVBS_*`, or with
 `gj_max_pull` = 3. The parameters were checked on tt only; mt and et are independent.
 
-Interpretation: the gain is largest for legs whose angle is measured precisely (σ/θ_max < 0.35),
-but `gauss` also helps legs whose angle error exceeds θ_max. There it acts like a soft penalty on
-extreme x, where θ(x) → 0. `rice` keeps only the genuine measurement information and is therefore
-weaker. Event-by-event vertex covariances should make the component more informative.
+Interpretation: `examples/gj_diagnostics.py` splits the gain by angle precision σ/θ_max and runs a
+null test. In the null test the measured angles, in units of θ_max, are shuffled between legs of
+similar σ/θ_max and FastMTT is rerun. The angle then carries no information about its leg, while the
+likelihood shapes stay the same. Change of the 68% half-width for 3-prong legs with SV, tt+mt+et
+(statistical uncertainty ±0.4%):
+
+| model | real angles | shuffled angles |
+|---|---|---|
+| `gauss` | −6.5% | −4.4% |
+| `rice` | −1.7% | +0.1% |
+
+About two thirds of the `gauss` gain therefore does not come from the vertex measurement. When
+σ ≳ θ_max the measured angle is mostly noise and usually exceeds θ_max. `gauss` then favours the x
+with the largest θ(x) and penalises x near the kinematic limits, where θ(x) → 0. It does so in the
+same way for every such leg, which makes it a prior on x. `rice` integrates over the unknown azimuth
+and becomes flat in x for these legs. The genuine information, about 2% and similar in both models,
+sits in the legs with σ/θ_max < 0.5, where `rice` gives −4.2%. Event-by-event vertex covariances
+should make the component more informative.
 
 The component costs about 40–50% extra run time (tt: 17 s → 25 s on 8 workers).
